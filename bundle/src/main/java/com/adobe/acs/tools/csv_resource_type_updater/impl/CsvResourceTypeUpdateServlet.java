@@ -21,28 +21,33 @@
 package com.adobe.acs.tools.csv_resource_type_updater.impl;
 
 import com.adobe.acs.tools.csv.impl.CsvUtil;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonPrimitive;
+import com.day.cq.dam.api.Asset;
 import org.apache.commons.lang.StringUtils;
 import org.apache.felix.scr.annotations.sling.SlingServlet;
 import org.apache.sling.api.SlingHttpServletRequest;
 import org.apache.sling.api.SlingHttpServletResponse;
-import org.apache.sling.api.resource.ModifiableValueMap;
-import org.apache.sling.api.resource.PersistenceException;
-import org.apache.sling.api.resource.Resource;
-import org.apache.sling.api.resource.ResourceResolver;
+import org.apache.sling.api.resource.*;
 import org.apache.sling.api.servlets.SlingAllMethodsServlet;
+import org.apache.sling.commons.json.JSONArray;
 import org.apache.sling.commons.json.JSONException;
 import org.apache.sling.commons.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.jcr.RepositoryException;
 import javax.jcr.Session;
-import java.io.IOException;
+import java.io.*;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 @SlingServlet(
         label = "ACS AEM Tools - CSV Resource Type Updater Servlet",
@@ -55,10 +60,11 @@ public class CsvResourceTypeUpdateServlet extends SlingAllMethodsServlet {
     private static final Logger log = LoggerFactory.getLogger(CsvResourceTypeUpdateServlet.class);
 
     private static final int DEFAULT_BATCH_SIZE = 1000;
+    private static final Pattern DECIMAL_REGEX = Pattern.compile("-?\\d+\\.\\d+");
 
     // 3 to account for Line Termination
     private static final int VALID_ROW_LENGTH = 3;
-
+    private JSONObject propertiesObject = null;
 
     @Override
     protected final void doPost(final SlingHttpServletRequest request, final SlingHttpServletResponse response)
@@ -77,7 +83,7 @@ public class CsvResourceTypeUpdateServlet extends SlingAllMethodsServlet {
 
             try {
                 request.getResourceResolver().adaptTo(Session.class).getWorkspace().getObservationManager().setUserData("acs-aem-tools.csv-resource-type-updater");
-
+                propertiesObject  = getPropertiesMappingJsonFile(request);
                 final Result result = this.update(request.getResourceResolver(), params, rows);
 
                 if (log.isInfoEnabled()) {
@@ -118,7 +124,7 @@ public class CsvResourceTypeUpdateServlet extends SlingAllMethodsServlet {
      */
     private Result update(final ResourceResolver resourceResolver,
                           final Parameters params,
-                          final Iterator<String[]> rows) throws PersistenceException {
+                          final Iterator<String[]> rows) throws PersistenceException, JSONException {
 
         final Result result = new Result();
 
@@ -155,12 +161,50 @@ public class CsvResourceTypeUpdateServlet extends SlingAllMethodsServlet {
         while (resources.hasNext()) {
             final Resource resource = resources.next();
             final ModifiableValueMap properties = resource.adaptTo(ModifiableValueMap.class);
+            String oldResourceType = properties.get(params.getPropertyName(), String.class);
+            String newValue = map.get(oldResourceType);
 
-            String newValue = map.get(properties.get(params.getPropertyName(), String.class));
 
             if (newValue != null) {
                 try {
-                    properties.put(params.getPropertyName(), newValue);
+                    JSONObject obj;
+                    if (null != propertiesObject) {
+                        try {
+                            obj = propertiesObject.getJSONObject(oldResourceType);
+                            properties.put(params.getPropertyName(), newValue);
+
+                            if(null != obj){
+                                JSONObject addObject = null;
+                                if (obj.has("add")) {
+                                    addObject = obj.getJSONObject("add");
+                                }
+                                JSONObject updateObject = null;
+                                if (obj.has("update")) {
+                                    updateObject = obj.getJSONObject("update");
+                                }
+                                JSONArray deleteArray = null;
+                                if (obj.has("delete")) {
+                                    deleteArray = obj.getJSONArray("delete");
+                                }
+
+                                if(null != addObject){
+                                    handleAddProperties(addObject, properties, resource);
+                                }
+                                if(null != updateObject){
+                                    handleUpdateProperties(updateObject, properties, resource);
+                                }
+                                if(null != deleteArray){
+                                    handleDeleteProperties(deleteArray, properties, resource);
+                                }
+                            }
+                        } catch (JSONException e) {
+                            log.error("[ {} ] was not available in [ /content/dam/resource-props.json ]", oldResourceType, e);
+                        }
+
+
+                    } else {
+                        log.error("Object is NULL due to component properties resource not found");
+                    }
                     result.addSuccess(resource.getPath());
                     count++;
                 } catch (Exception e) {
@@ -174,6 +218,7 @@ public class CsvResourceTypeUpdateServlet extends SlingAllMethodsServlet {
                 }
             }
         }
+
 
         this.save(resourceResolver, count);
 
@@ -196,6 +241,118 @@ public class CsvResourceTypeUpdateServlet extends SlingAllMethodsServlet {
             }
         } else {
             log.debug("Nothing to save");
+        }
+    }
+
+    private JSONObject getPropertiesMappingJsonFile(SlingHttpServletRequest request ){
+        JSONObject jsonObj = null;
+        try{
+            Resource jsonResource = request.getResourceResolver().getResource("/content/dam/resource-props.json");
+            if (null != jsonResource) {
+                Asset asset = jsonResource.adaptTo(Asset.class);
+                Resource original = asset.getOriginal();
+                InputStream content = original.adaptTo(InputStream.class);
+                StringBuilder sb = new StringBuilder();
+                String line;
+                BufferedReader br = new BufferedReader(new InputStreamReader(
+                        content, "UTF-8"));
+
+                while ((line = br.readLine()) != null) {
+                    sb.append(line);
+                }
+                jsonObj = new JSONObject(sb.toString());
+            }else{
+                log.error("Could not find file [ {} ]", "/content/dam/resource-props.json");
+            }
+        } catch (UnsupportedEncodingException e) {
+            e.printStackTrace();
+        } catch (IOException e) {
+            e.printStackTrace();
+        } catch (JSONException e) {
+            e.printStackTrace();
+        }
+        return jsonObj;
+    }
+
+    private void handleAddProperties(JSONObject addFields, ModifiableValueMap properties, Resource resource) throws JSONException {
+        Iterator<String> fields = addFields.keys();
+        while (fields.hasNext()){
+            String field = fields.next();
+            try {
+                if(!addFields.get(field).getClass().getName().equals("org.apache.sling.commons.json.JSONArray")){
+                    properties.put(field, addFields.get(field));
+                }else{
+                    JSONArray jsonArray = addFields.getJSONArray(field);
+                    JsonArray gJsonarray = new Gson().fromJson(jsonArray.toString(), JsonArray.class);
+                    setArrayProperty(gJsonarray, field, resource);
+                }
+            } catch (Exception e) {
+                log.warn("handleAddProperties : Could not add property [ {}@" + field + " : " + addFields.get(field) + " ]", resource.getPath(), e);
+            }
+        }
+
+    }
+
+    private void handleUpdateProperties(JSONObject updateFields, ModifiableValueMap properties, Resource resource) throws JSONException {
+        Iterator<String> fields = updateFields.keys();
+        while (fields.hasNext()){
+            String field = fields.next();
+            Object fieldVal = properties.get(field);
+            try {
+                if (properties.containsKey(field)) {
+                    properties.remove(field);
+                    properties.put(updateFields.getString(field), fieldVal);
+                }
+            } catch (Exception e) {
+                log.warn("handleUpdateProperties : Could not update property [ {}@" + field + " : " + updateFields.get(field) + " ]", resource.getPath(), e);
+            }
+        }
+
+    }
+
+    private void handleDeleteProperties(JSONArray deleteFields, ModifiableValueMap properties, Resource resource) throws JSONException {
+        for (int i = 0, size = deleteFields.length(); i < size; i++) {
+            String field = deleteFields.getString(i);
+            try {
+                properties.remove(field);
+            } catch (Exception e) {
+                log.warn("handleDeleteProperties : Could not delete property [ {}@" + field +  " ]", resource.getPath(), e);
+            }
+        }
+    }
+
+    private void setArrayProperty(final JsonArray jsonArray, final String key, final Resource resource) {
+        JsonPrimitive firstVal = jsonArray.get(0).getAsJsonPrimitive();
+
+        try {
+            Object[] values;
+            if (firstVal.isBoolean()) {
+                values = new Boolean[jsonArray.size()];
+                for (int i = 0; i < jsonArray.size(); i++) {
+                    values[i] = jsonArray.get(i).getAsBoolean();
+                }
+            } else if (DECIMAL_REGEX.matcher(firstVal.getAsString()).matches()) {
+                values = new BigDecimal[jsonArray.size()];
+                for (int i = 0; i < jsonArray.size(); i++) {
+                    values[i] = jsonArray.get(i).getAsBigDecimal();
+                }
+            } else if (firstVal.isNumber()) {
+                values = new Long[jsonArray.size()];
+                for (int i = 0; i < jsonArray.size(); i++) {
+                    values[i] = jsonArray.get(i).getAsLong();
+                }
+            } else {
+                values = new String[jsonArray.size()];
+                for (int i = 0; i < jsonArray.size(); i++) {
+                    values[i] = jsonArray.get(i).getAsString();
+                }
+            }
+
+            ValueMap resourceProperties = resource.adaptTo(ModifiableValueMap.class);
+            resourceProperties.put(key, values);
+            log.trace("Array property '{}' added for resource '{}'", key, resource.getPath());
+        } catch (Exception e) {
+            log.error("Unable to assign property '{}' to resource '{}'", key, resource.getPath());
         }
     }
 
